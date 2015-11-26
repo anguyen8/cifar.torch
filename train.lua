@@ -5,6 +5,8 @@ dofile './provider.lua'
 local c = require 'trepl.colorize'
 
 opt = lapp[[
+   -n,--network               (default "")          reload pretrained network
+   --saveFreq                 (default 2)          save every saveFreq epochs                     
    -s,--save                  (default "logs")      subdirectory to save logs
    -b,--batchSize             (default 128)          batch size
    -r,--learningRate          (default 1)        learning rate
@@ -14,7 +16,23 @@ opt = lapp[[
    --epoch_step               (default 25)          epoch step
    --model                    (default vgg_bn_drop)     model name
    --max_epoch                (default 300)           maximum number of iterations
+   --gpu                      (default 1)           maximum number of iterations
+   -t,--threads       (default 4)           number of threads
 ]]
+
+if opt.gpu > -1 then
+  cutorch.setDevice(opt.gpu + 1)
+  print('<gpu> using device ' .. opt.gpu)
+  --torch.setdefaulttensortype('torch.CudaTensor')
+
+  opt.gpu = true
+else
+  opt.gpu = false
+end
+
+-- threads
+torch.setnumthreads(opt.threads)
+print('<torch> set nb of threads to ' .. torch.getnumthreads())
 
 print(opt)
 
@@ -40,12 +58,26 @@ do -- data augmentation module
 end
 
 print(c.blue '==>' ..' configuring model')
-local model = nn.Sequential()
-model:add(nn.BatchFlip():float())
-model:add(nn.Copy('torch.FloatTensor','torch.CudaTensor'):cuda())
-model:add(dofile('models/'..opt.model..'.lua'):cuda())
-model:get(2).updateGradInput = function(input) return end
-print(model)
+
+local model = nil
+
+if opt.network == '' then
+
+  print ("Initialize a new network...")
+
+  model = nn.Sequential()
+  model:add(nn.BatchFlip():float())
+  model:add(nn.Copy('torch.FloatTensor','torch.CudaTensor'):cuda())
+  model:add(dofile('models/'..opt.model..'.lua'):cuda())
+  model:get(2).updateGradInput = function(input) return end
+  print(model)
+
+else
+
+  print('<trainer> reloading previously trained network: ' .. opt.network)
+  model = torch.load(opt.network):cuda()
+
+end
 
 print(c.blue '==>' ..' loading data')
 provider = torch.load 'provider.t7'
@@ -56,9 +88,11 @@ confusion = optim.ConfusionMatrix(10)
 
 print('Will save at '..opt.save)
 paths.mkdir(opt.save)
-testLogger = optim.Logger(paths.concat(opt.save, 'test.log'))
-testLogger:setNames{'% mean class accuracy (train set)', '% mean class accuracy (test set)'}
-testLogger.showPlot = false
+--testLogger = optim.Logger(paths.concat(opt.save, 'test.log'))
+--testLogger:setNames{'% mean class accuracy (train set)', '% mean class accuracy (test set)'}
+--testLogger.showPlot = false
+
+testLogger = false
 
 parameters,gradParameters = model:getParameters()
 
@@ -97,6 +131,8 @@ function train()
     local inputs = provider.trainData.data:index(1,v)
     targets:copy(provider.trainData.labels:index(1,v))
 
+    inputs = inputs:cuda()
+
     local feval = function(x)
       if x ~= parameters then parameters:copy(x) end
       gradParameters:zero()
@@ -123,6 +159,11 @@ function train()
   epoch = epoch + 1
 end
 
+
+function save_model(filename, model)
+   -- Save the CPU version
+  torch.save(filename, model:float())
+end
 
 function test()
   -- disable flips, dropouts and batch normalization
@@ -174,10 +215,22 @@ function test()
   end
 
   -- save model every 50 epochs
-  if epoch % 50 == 0 then
-    local filename = paths.concat(opt.save, 'model.net')
-    print('==> saving model to '..filename)
-    torch.save(filename, model:get(3))
+  if epoch % opt.saveFreq == 0 then
+    -- local filename = paths.concat(opt.save, 'model.net')
+    -- print('==> saving model to '..filename)
+    -- torch.save(filename, model:get(3))
+
+    local pad_epoch = string.format("%05d", epoch + 1)
+    local filename = paths.concat(opt.save, pad_epoch .. '.net')
+    local symbolic = paths.concat(opt.save, 'cifar.net')
+    os.execute('mkdir -p ' .. sys.dirname(filename))
+    os.execute('ln -s ' .. sys.dirname(filename) .. ' ' .. symbolic)
+    if paths.filep(filename) then
+       os.execute('mv ' .. filename .. ' ' .. filename .. '.old')
+    end
+
+    save_model(filename, model:get(3):clone())
+    print('<trainer> saved network to '..filename)
   end
 
   confusion:zero()
